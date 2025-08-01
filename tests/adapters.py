@@ -10,7 +10,10 @@ import torch
 from torch import Tensor
 from cs336_basics.tokenizer import train_bpe
 from cs336_basics.tokenizer import Tokenizer
-
+from cs336_basics.transformers import (
+    Linear, Embedding, RMSNorm, SwiGLUFFN, RotaryPositionalEmbedding, MultiHeadSelfAttention
+    , scaled_dot_product_attention, TransformersBlock, TransformersLM
+)
 
 def run_linear(
     d_in: int,
@@ -30,8 +33,9 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    linear = Linear(d_in, d_out)
+    linear.W.data = weights
+    return linear(in_features) 
 
 
 def run_embedding(
@@ -52,8 +56,9 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    embedding_layer = Embedding(vocab_size, d_model)
+    embedding_layer.weight.data = weights
+    return embedding_layer(token_ids)
 
 
 def run_swiglu(
@@ -85,7 +90,11 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    ffn = SwiGLUFFN(d_model, d_ff)
+    ffn.linear1.W.data = w1_weight
+    ffn.linear2.W.data = w2_weight
+    ffn.linear3.W.data = w3_weight
+    return ffn(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -106,7 +115,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 
 def run_multihead_self_attention(
@@ -140,7 +149,16 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    mha = MultiHeadSelfAttention(d_model, num_heads)
+    qkv_proj_weights = torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0)
+    state_dict = {
+        "qkv_proj.W": qkv_proj_weights,
+        "out_proj.W": o_proj_weight
+    }
+    mha.load_state_dict(state_dict)
+    mha.to(in_features.device)
+    return mha(in_features)
+
 
 
 def run_multihead_self_attention_with_rope(
@@ -180,7 +198,16 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    rope = RotaryPositionalEmbedding(theta, d_model // num_heads, max_seq_len)
+    mha = MultiHeadSelfAttention(d_model, num_heads, rope=rope)
+    qkv_proj_weights = torch.cat([q_proj_weight, k_proj_weight, v_proj_weight], dim=0)
+    state_dict = {
+        "qkv_proj.W": qkv_proj_weights,
+        "out_proj.W": o_proj_weight
+    }
+    mha.load_state_dict(state_dict)
+    mha.to(in_features.device)
+    return mha(in_features, token_positions=token_positions)
 
 
 def run_rope(
@@ -202,7 +229,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    rope = RotaryPositionalEmbedding(theta, d_k, max_seq_len)
+    return rope(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -275,7 +303,24 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    rope = RotaryPositionalEmbedding(d_k=d_model // num_heads, max_seq_len=max_seq_len, theta=theta)
+    transformers_block = TransformersBlock(d_model, num_heads, d_ff, rope=rope)
+    qkv_weight = torch.cat(
+        [weights["attn.q_proj.weight"], weights["attn.k_proj.weight"], weights["attn.v_proj.weight"]], dim=0
+    )
+    state_dict = {
+        "attention.qkv_proj.W": qkv_weight,
+        "attention.out_proj.W": weights["attn.output_proj.weight"],
+        "ffn.linear1.W": weights["ffn.w1.weight"],
+        "ffn.linear2.W": weights["ffn.w2.weight"],
+        "ffn.linear3.W": weights["ffn.w3.weight"],
+        "norm1.weights": weights["ln1.weight"],
+        "norm2.weights": weights["ln2.weight"],
+    }
+    transformers_block.load_state_dict(state_dict)
+    return transformers_block(in_features)
+
+
 
 
 def run_transformer_lm(
@@ -357,7 +402,39 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    model = TransformersLM(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        context_length=context_length,
+        rope_theta=rope_theta,
+    )
+    state_dict_to_load = {
+        "embeddings.weight": weights["token_embeddings.weight"],
+        "final_norm.weights": weights["ln_final.weight"],
+        "lm_head.W": weights["lm_head.weight"],
+    }
+    for i in range(num_layers):
+        qkv_weight = torch.cat(
+            [
+                weights[f"layers.{i}.attn.q_proj.weight"],
+                weights[f"layers.{i}.attn.k_proj.weight"],
+                weights[f"layers.{i}.attn.v_proj.weight"],
+            ],
+            dim=0,
+        )
+        state_dict_to_load[f"transformer_blocks.{i}.attention.qkv_proj.W"] = qkv_weight
+        state_dict_to_load[f"transformer_blocks.{i}.attention.out_proj.W"] = weights[f"layers.{i}.attn.output_proj.weight"]
+        state_dict_to_load[f"transformer_blocks.{i}.norm1.weights"] = weights[f"layers.{i}.ln1.weight"]
+        state_dict_to_load[f"transformer_blocks.{i}.norm2.weights"] = weights[f"layers.{i}.ln2.weight"]
+        state_dict_to_load[f"transformer_blocks.{i}.ffn.linear1.W"] = weights[f"layers.{i}.ffn.w1.weight"]
+        state_dict_to_load[f"transformer_blocks.{i}.ffn.linear2.W"] = weights[f"layers.{i}.ffn.w2.weight"]
+        state_dict_to_load[f"transformer_blocks.{i}.ffn.linear3.W"] = weights[f"layers.{i}.ffn.w3.weight"]
+    model.load_state_dict(state_dict_to_load)
+    model.to(in_indices.device)
+    return model(in_indices, token_positions=None)
 
 
 def run_rmsnorm(
@@ -380,7 +457,9 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    rmsnorm = RMSNorm(d_model, eps)
+    rmsnorm.weights.data = weights
+    return rmsnorm(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
